@@ -193,98 +193,80 @@ def get_hyper_tables(hyper_path: Path):
     return tables
 
 
-def field_to_sql_expr(raw: str, columns: list) -> str:
+def get_hyper_schema(hyper_path: Path) -> list:
     """
-    Convert a Tableau field reference to a SQL expression.
-    columns is a list of column name strings from the hyper table.
+    Open the .hyper file and return a list of table dicts:
+      [{ "table_obj": ..., "schema": str, "table": str, "columns": [{"name":str,"type":str}] }]
     """
-    # Try to extract aggregation and field
-    m = re.match(r'\[(\w+):([^\]:]+)(?::[^\]]+)?\]', raw)
-    if m:
-        agg, field = m.group(1).upper(), m.group(2)
-        # Find matching column (case-insensitive)
-        col = next((c for c in columns if c.lower() == field.lower()), None)
-        if col:
-            agg_map = {
-                "SUM": "SUM", "AVG": "AVG", "COUNT": "COUNT",
-                "COUNTD": "COUNT DISTINCT", "MIN": "MIN", "MAX": "MAX",
-                "MEDIAN": "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY",
-            }
-            sql_agg = agg_map.get(agg, agg)
-            if agg == "MEDIAN":
-                return f'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "{col}")'
-            elif agg == "ATTR":
-                return f'MIN("{col}")'
-            else:
-                return f'{sql_agg}("{col}")'
-
-    # Plain [FieldName]
-    m = re.match(r'\[([^\]]+)\]', raw)
-    if m:
-        field = m.group(1)
-        col = next((c for c in columns if c.lower() == field.lower()), None)
-        if col:
-            return f'MIN("{col}")'
-
-    return None
+    tables = []
+    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+        with Connection(hyper.endpoint, str(hyper_path)) as conn:
+            catalog = conn.catalog
+            for schema in catalog.get_schema_names():
+                for tbl in catalog.get_table_names(schema):
+                    td   = catalog.get_table_definition(tbl)
+                    cols = []
+                    for c in td.columns:
+                        type_str = str(c.type).lower()
+                        cols.append({"name": c.name.unescaped, "type": type_str})
+                    tables.append({
+                        "table_obj": tbl,
+                        "schema":    str(schema),
+                        "table":     str(tbl.name),
+                        "columns":   cols,
+                    })
+    return tables
 
 
-def query_figures(hyper_path: Path, ws_fields: dict) -> dict:
+def is_numeric_type(type_str: str) -> bool:
+    """Return True if this Hyper column type is numeric."""
+    return any(t in type_str for t in [
+        "int", "float", "double", "numeric", "decimal",
+        "real", "big", "small", "tiny", "money", "currency",
+    ])
+
+
+def query_all_figures(hyper_path: Path, ws_names: list) -> dict:
     """
-    For each worksheet's measure fields, query the hyper extract
-    and return { worksheet_name: [{"label": ..., "value": ...}] }
+    Read every column from the .hyper extract and return the first
+    non-null value from each one — exactly as Tableau already computed it.
+    No aggregation applied.
+
+    Returns:
+      { worksheet_name: [{"label": str, "value": any}] }
+    All worksheets share the same list; the user assigns figures to
+    worksheets interactively.
     """
-    results = {}
+    schema = get_hyper_schema(hyper_path)
+    if not schema:
+        return {}
+
+    primary  = schema[0]
+    tbl_obj  = primary["table_obj"]
+    all_cols = primary["columns"]
+
+    figures = []
 
     with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
         with Connection(hyper.endpoint, str(hyper_path)) as conn:
+            for col in all_cols:
+                col_name  = col["name"]
+                safe_name = f'"{col_name}"'
+                display   = col_name.replace("_", " ").replace("-", " ").title()
+                try:
+                    # Grab the first non-null value — already the computed figure
+                    sql    = f'SELECT {safe_name} FROM {tbl_obj} WHERE {safe_name} IS NOT NULL LIMIT 1'
+                    result = conn.execute_scalar_query(sql)
+                    if result is not None:
+                        figures.append({"label": display, "value": result})
+                except Exception:
+                    continue
 
-            # Get available tables and columns
-            catalog = conn.catalog
-            all_tables = []
-            for schema in catalog.get_schema_names():
-                for tbl in catalog.get_table_names(schema):
-                    td = catalog.get_table_definition(tbl)
-                    cols = [c.name.unescaped for c in td.columns]
-                    all_tables.append({
-                        "schema": str(schema),
-                        "table": str(tbl.name),
-                        "table_obj": tbl,
-                        "columns": cols,
-                    })
+    if not figures:
+        return {}
 
-            if not all_tables:
-                return {}
+    return {ws: figures for ws in ws_names}
 
-            # Use the first (usually only) table
-            primary = all_tables[0]
-            cols    = primary["columns"]
-            tbl_obj = primary["table_obj"]
-
-            for ws_name, fields in ws_fields.items():
-                figures = []
-                measure_fields = [f for f in fields if f["role"] == "measure"]
-
-                for field in measure_fields:
-                    expr = field_to_sql_expr(field["raw"], cols)
-                    if not expr:
-                        continue
-                    try:
-                        sql    = f'SELECT {expr} FROM {tbl_obj}'
-                        result = conn.execute_scalar_query(sql)
-                        if result is not None:
-                            figures.append({
-                                "label": field["label"],
-                                "value": result,
-                            })
-                    except Exception:
-                        # Field doesn't exist in this table — skip silently
-                        continue
-
-                if figures:
-                    results[ws_name] = figures
-
-    return results
 
 
 # ─────────────────────────────────────────────
@@ -310,49 +292,94 @@ def fmt(value):
 
 def interactive_select(figures_by_ws: dict) -> list:
     """
-    Present each worksheet's figures and let the user pick which to include.
-    Returns a list of { "worksheet": ..., "label": ..., "value": ... }
-    """
-    selected = []
-    ws_list  = [(ws, figs) for ws, figs in figures_by_ws.items() if figs]
+    New flow — figures come from the .hyper schema directly, not the XML.
+    All worksheets share the same available figure list.
 
-    if not ws_list:
-        print("\nNo queryable figures found in any worksheet.")
+    Step 1: Show all available figures and let the user pick which ones to include.
+    Step 2: For each picked figure, ask which worksheet to label it under
+            (or let them type a custom label if they prefer).
+
+    Returns a list of { "worksheet": str, "label": str, "value": ..., "value_fmt": str }
+    """
+    if not figures_by_ws:
+        print("\nNo figures available.")
         return []
 
+    # All worksheets share the same figure list — grab it from the first entry
+    all_figs = next(iter(figures_by_ws.values()))
+    ws_names = list(figures_by_ws.keys())
+
     print("\n" + "═"*60)
-    print("  FIGURE SELECTOR")
-    print("  For each worksheet, enter the numbers of figures to")
-    print("  include, separated by commas. Press ENTER to skip.")
+    print("  STEP 1 — AVAILABLE FIGURES")
+    print("  These figures come directly from the extract.")
+    print("  Enter the numbers you want to include (e.g. 1,3,5)")
+    print("  or press ENTER to include all.")
+    print("═"*60)
+    print()
+    for i, fig in enumerate(all_figs, start=1):
+        print(f"  [{i:>3}] {fig['label']:<40} {fmt(fig['value']):>15}")
+    print()
+
+    while True:
+        raw = input("  Select figures (ENTER = all): ").strip()
+        if not raw:
+            chosen_figs = list(range(len(all_figs)))
+            break
+        try:
+            choices = [int(x.strip()) - 1 for x in raw.split(",")]
+            if all(0 <= c < len(all_figs) for c in choices):
+                chosen_figs = choices
+                break
+            else:
+                print(f"  Please enter numbers between 1 and {len(all_figs)}.")
+        except ValueError:
+            print("  Invalid input — enter numbers separated by commas.")
+
+    if not chosen_figs:
+        return []
+
+    print(f"\n  {len(chosen_figs)} figure(s) selected.")
+
+    # Step 2 — assign each figure to a worksheet
+    print("\n" + "═"*60)
+    print("  STEP 2 — ASSIGN TO WORKSHEETS")
+    print("  For each figure, choose which worksheet to label it under.")
+    print("  Enter a number from the list, or type a custom name.")
     print("═"*60)
 
-    for ws_name, figs in ws_list:
-        print(f"\n📄 Worksheet: {ws_name}")
-        print("  " + "─"*50)
-        for i, fig in enumerate(figs, start=1):
-            print(f"  [{i}] {fig['label']:<35} {fmt(fig['value']):>15}")
-        print()
+    print("\n  Worksheets:")
+    for i, ws in enumerate(ws_names, start=1):
+        print(f"  [{i:>3}] {ws}")
+    print()
 
+    selected = []
+    for idx in chosen_figs:
+        fig = all_figs[idx]
+        print(f"  Figure: {fig['label']}  =  {fmt(fig['value'])}")
         while True:
-            raw = input("  Include? (e.g. 1,3 or ENTER to skip): ").strip()
+            raw = input("  Worksheet (number or custom name, ENTER to skip): ").strip()
             if not raw:
                 break
+            # Check if it's a number
             try:
-                choices = [int(x.strip()) for x in raw.split(",")]
-                if all(1 <= c <= len(figs) for c in choices):
-                    for c in choices:
-                        fig = figs[c-1]
-                        selected.append({
-                            "worksheet": ws_name,
-                            "label":     fig["label"],
-                            "value":     fig["value"],
-                            "value_fmt": fmt(fig["value"]),
-                        })
-                    break
+                ws_idx = int(raw) - 1
+                if 0 <= ws_idx < len(ws_names):
+                    ws_label = ws_names[ws_idx]
                 else:
-                    print(f"  Please enter numbers between 1 and {len(figs)}.")
+                    print(f"  Please enter a number between 1 and {len(ws_names)}.")
+                    continue
             except ValueError:
-                print("  Invalid input — enter numbers separated by commas.")
+                # Treat as a custom worksheet name
+                ws_label = raw
+
+            selected.append({
+                "worksheet": ws_label,
+                "label":     fig["label"],
+                "value":     fig["value"],
+                "value_fmt": fmt(fig["value"]),
+            })
+            break
+        print()
 
     return selected
 
@@ -396,7 +423,7 @@ def write_figures_xlsx(selected: list, workbook_name: str, path: Path):
     ws1.freeze_panes = "A2"
 
     for i, row in enumerate(selected, start=2):
-        row_data = [workbook_name, row["worksheet"], row["label"], row["value_fmt"]]
+        row_data = [row.get("workbook", workbook_name), row["worksheet"], row["label"], row["value_fmt"]]
         ws1.append(row_data)
         rf = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
         for col, val in enumerate(row_data, start=1):
@@ -462,20 +489,27 @@ def write_figures_xlsx(selected: list, workbook_name: str, path: Path):
 # ─────────────────────────────────────────────
 
 def write_figures_html(selected: list, workbook_name: str, path: Path):
-    # Group by worksheet
-    by_ws = defaultdict(list)
+    # Group by workbook then worksheet
+    by_wb = defaultdict(lambda: defaultdict(list))
     for row in selected:
-        by_ws[row["worksheet"]].append(row)
+        wb_key = row.get("workbook", workbook_name)
+        by_wb[wb_key][row["worksheet"]].append(row)
 
     cards_html = ""
-    for ws_name, figs in by_ws.items():
-        fig_html = "".join(f"""
+    for wb_key, sheets in by_wb.items():
+        # Workbook section header (only shown if more than one workbook)
+        wb_count = len(by_wb)
+        if wb_count > 1:
+            cards_html += f"""
+      <div class="wb-section-header">📁 {wb_key}</div>"""
+        for ws_name, figs in sheets.items():
+            fig_html = "".join(f"""
         <div class="fig-row">
           <span class="fig-label">{fig['label']}</span>
           <span class="fig-value">{fig['value_fmt']}</span>
         </div>""" for fig in figs)
 
-        cards_html += f"""
+            cards_html += f"""
       <div class="card">
         <div class="card-header">
           <span class="ws-icon">📄</span>
@@ -487,7 +521,7 @@ def write_figures_html(selected: list, workbook_name: str, path: Path):
       </div>"""
 
     total = len(selected)
-    ws_count = len(by_ws)
+    ws_count = sum(len(s) for s in by_wb.values())
     data_json = json.dumps(selected, ensure_ascii=False, default=str)
 
     html = f"""<!DOCTYPE html>
@@ -543,6 +577,8 @@ main{{padding:24px 32px;max-width:1200px}}
 .fig-label{{font-size:13px;color:var(--muted);flex:1}}
 .fig-value{{font-size:15px;font-weight:700;color:var(--text);font-family:var(--mono);margin-left:16px}}
 .empty{{text-align:center;padding:60px;color:var(--muted)}}
+.wb-section-header{{grid-column:1/-1;font-size:15px;font-weight:700;color:var(--green);
+  padding:8px 4px 4px;border-bottom:1px solid var(--border);margin-bottom:4px}}
 .hidden{{display:none}}
 </style>
 </head>
@@ -620,78 +656,129 @@ function exportCSV() {{
 #  MAIN
 # ─────────────────────────────────────────────
 
+def process_workbook(filepath: Path) -> list:
+    """
+    Extract, parse, query and interactively select figures from a single .twbx.
+    Returns selected figure dicts, each tagged with a 'workbook' key.
+    """
+    print(f"\n{'='*60}")
+    print(f"  Workbook: {filepath.name}")
+    print(f"{'='*60}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        print("  Extracting archive...")
+        try:
+            twb_path, hyper_path = extract_twbx(filepath, tmp)
+        except Exception as e:
+            print(f"  Error extracting: {e} — skipping.")
+            return []
+
+        if not hyper_path:
+            print("  No .hyper extract found — skipping.")
+            print("  (This script requires workbooks with a data extract.)")
+            return []
+
+        print(f"  Found extract: {hyper_path.name}")
+
+        print("  Parsing worksheet fields...")
+        try:
+            ws_fields = parse_worksheet_fields(twb_path)
+            print(f"  Found {len(ws_fields)} worksheets")
+        except Exception as e:
+            print(f"  Error parsing workbook XML: {e} — skipping.")
+            return []
+
+        print("  Querying extract...")
+        try:
+            ws_names      = list(ws_fields.keys())
+            figures_by_ws = query_all_figures(hyper_path, ws_names)
+            total_figs    = len(next(iter(figures_by_ws.values()), []))
+            print(f"  Found {total_figs} available figures to choose from")
+        except Exception as e:
+            print(f"  Error querying extract: {e} — skipping.")
+            return []
+
+        if not figures_by_ws:
+            print("  No numeric columns found in extract — skipping.")
+            return []
+
+        selected = interactive_select(figures_by_ws)
+
+        # Tag every selected figure with its workbook name
+        wb_name = filepath.stem
+        for row in selected:
+            row["workbook"] = wb_name
+
+        return selected
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tableau figure extractor.")
-    parser.add_argument("--file",   required=True, help=".twbx file to read")
-    parser.add_argument("--output", default="figures", help="Output filename prefix")
+    group  = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--file",   help="Single .twbx file to process")
+    group.add_argument("--folder", help="Folder containing .twbx files to process")
+    parser.add_argument("--output", default="figures",
+                        help="Output filename prefix (default: figures)")
     args = parser.parse_args()
-
-    filepath = Path(args.file)
-    if not filepath.exists():
-        print(f"Error: '{filepath}' not found."); sys.exit(1)
-    if filepath.suffix.lower() != ".twbx":
-        print("Error: only .twbx files are supported (extracts required)."); sys.exit(1)
 
     if not HAS_HYPER:
         print("Error: tableauhyperapi not installed.")
         print("  Run: pip install tableauhyperapi")
         sys.exit(1)
 
-    print(f"\nReading: {filepath.name}")
+    # ── Resolve file list ──
+    if args.file:
+        filepath = Path(args.file)
+        if not filepath.exists():
+            print(f"Error: '{filepath}' not found."); sys.exit(1)
+        if filepath.suffix.lower() != ".twbx":
+            print("Error: only .twbx files are supported."); sys.exit(1)
+        files   = [filepath]
+        out_dir = filepath.parent
+    else:
+        folder = Path(args.folder)
+        if not folder.exists():
+            print(f"Error: '{folder}' not found."); sys.exit(1)
+        files = sorted(folder.glob("*.twbx"))
+        if not files:
+            print(f"No .twbx files found in '{folder}'."); sys.exit(1)
+        out_dir = folder
+        print(f"\nFound {len(files)} workbook(s) in '{folder}'")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    # ── Process each workbook ──
+    all_selected = []
+    skipped      = []
 
-        print("  Extracting archive…")
-        try:
-            twb_path, hyper_path = extract_twbx(filepath, tmp)
-        except Exception as e:
-            print(f"  Error extracting: {e}"); sys.exit(1)
+    for fp in files:
+        selected = process_workbook(fp)
+        if selected:
+            all_selected.extend(selected)
+        else:
+            skipped.append(fp.name)
 
-        if not hyper_path:
-            print("  No .hyper extract found in this workbook.")
-            print("  This script requires a workbook with a data extract.")
-            sys.exit(1)
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print(f"  {len(all_selected)} figure(s) selected across {len(files) - len(skipped)} workbook(s)")
+    if skipped:
+        print(f"  Skipped ({len(skipped)}): {', '.join(skipped)}")
+    print(f"{'='*60}")
 
-        print(f"  Found extract: {hyper_path.name}")
+    if not all_selected:
+        print("\nNo figures selected — nothing to write.")
+        sys.exit(0)
 
-        print("  Parsing worksheet fields…")
-        try:
-            ws_fields = parse_worksheet_fields(twb_path)
-            print(f"  Found {len(ws_fields)} worksheets")
-        except Exception as e:
-            print(f"  Error parsing workbook XML: {e}"); sys.exit(1)
+    print("\nWriting output...\n")
 
-        print("  Querying extract…")
-        try:
-            figures_by_ws = query_figures(hyper_path, ws_fields)
-            total_figs = sum(len(v) for v in figures_by_ws.values())
-            print(f"  Found {total_figs} queryable figures across {len(figures_by_ws)} worksheets")
-        except Exception as e:
-            print(f"  Error querying extract: {e}"); sys.exit(1)
+    label     = files[0].stem if len(files) == 1 else f"{len(files)} Workbooks"
+    xlsx_path = out_dir / f"{args.output}.xlsx"
+    html_path = out_dir / f"{args.output}.html"
 
-        if not figures_by_ws:
-            print("\nNo queryable figures found. The extract may be empty or use unsupported field types.")
-            sys.exit(0)
+    write_figures_xlsx(all_selected, label, xlsx_path)
+    write_figures_html(all_selected, label, html_path)
 
-        # Interactive selection
-        selected = interactive_select(figures_by_ws)
-
-        if not selected:
-            print("\nNo figures selected — nothing to write.")
-            sys.exit(0)
-
-        print(f"\n{len(selected)} figure(s) selected. Writing output…\n")
-
-        out_dir      = filepath.parent
-        wb_name      = filepath.stem
-        xlsx_path    = out_dir / f"{args.output}.xlsx"
-        html_path    = out_dir / f"{args.output}.html"
-
-        write_figures_xlsx(selected, wb_name, xlsx_path)
-        write_figures_html(selected, wb_name, html_path)
-
-        print(f"\nDone. Open {args.output}.html in any browser.")
+    print(f"\nDone. Open {args.output}.html in any browser.")
 
 
 if __name__ == "__main__":
